@@ -34,23 +34,33 @@ Index = Tuple[slice, ...]
 ArrayLike = Union[np.ndarray, DeviceArray]
 
 
-@dataclasses.dataclass(frozen=True)
 class Shard:
-  """A single data shard of an Array.
+  """A single data shard of an Array."""
 
-  Args:
-    device : Which device this shard resides on.
-    index : The index into the global array of this shard.
-    replica_id : Integer id indicating which replica of the global array this
-      shard is part of. Always 0 for fully sharded data
-      (i.e. when there’s only 1 replica).
-    data : The data of this shard. None if ``device`` is non-local.
-  """
-  device: Device
-  index: Index
-  replica_id: int
-  # None if this `Shard` lives on a non-addressable device.
-  data: Optional[Array] = None
+  def __init__(self, device: Device, sharding: Sharding, global_shape: Shape,
+               data: Optional[Array] = None):
+    self.device = device
+    self._sharding = sharding
+    self._global_shape = global_shape
+    self.data = data
+
+  @property
+  def index(self) -> Index:
+    if hasattr(self._sharding, 'device_indices'):
+      index = self._sharding.device_indices(self.device, self._global_shape)
+      assert index is not None
+      return index
+    else:
+      raise ValueError('Cannot calculate indices from sharding: '
+                       f'{self._sharding}. Please create a device to index '
+                       'mapping for your sharding.')
+
+  @property
+  def replica_id(self) -> int:
+    if hasattr(self._sharding, 'device_replica_id_map'):
+      return self._sharding.device_replica_id_map(self._global_shape)[self.device]
+    # Return `0` (assuming all shards are unique) instead of raising an error.
+    return 0
 
 
 class Array:
@@ -100,25 +110,20 @@ class Array:
 
   @pxla.maybe_cached_property
   def addressable_shards(self) -> Sequence[Shard]:
-    device_to_index = self.sharding.devices_indices_map(self.shape)
-    device_to_replica_id = self.sharding.device_replica_id_map(self.shape)
-
     out = []
     for db in self._arrays:
       db = pxla._set_aval(db)
       device = db.device()
-      index = device_to_index[device]
-      rid = device_to_replica_id[device]
       # Wrap the device arrays in `Array` until C++ returns an Array instead
       # of a DA.
       array = Array(db.shape, SingleDeviceSharding(device), [db], committed=True)
-      out.append(Shard(device, index, rid, array))
+      out.append(Shard(device, self.sharding, self.shape, array))
     return out
 
   def copy_to_host_async(self):
     for s in self.addressable_shards:
       if s.replica_id == 0:
-        s.data._arrays[0].copy_to_host_async()
+        s.data._arrays[0].copy_to_host_async()  # pytype: disable=attribute-error
 
   def _value(self) -> np.ndarray:
     # TODO(yashkatariya): Cache the numpy value if its already set.
